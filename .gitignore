@@ -1,0 +1,15 @@
+# Ignore the Python virtual environment
+venv/
+*.venv/
+.venv/
+
+# Ignore secrets
+.streamlit/secrets.toml
+*.env
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore IDE settings (for VS Code / Cursor)
+.vscode/
