@@ -10,7 +10,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 # --- CONFIGURATION ---
 # We use the same embedding model as before
-EMBEDDING_MODEL = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+EMBEDDING_MODEL = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 
 # 1. INGESTION FUNCTION (You already built this)
 def process_document_to_chroma(uploaded_file):
@@ -55,7 +55,7 @@ def answer_question(question):
     retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 5})
     
     # C. Initialize the LLM (Gemini 2.0 Flash - Fast & Free)
-    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.3)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.3)
     
     # D. Create the Prompt Template
     system_prompt = (

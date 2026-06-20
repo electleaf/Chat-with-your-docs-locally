@@ -1,0 +1,212 @@
+DocChat - Full Project Flow (Detailed)
+======================================
+
+This document explains, step by step, exactly how DocChat works internally: what each
+file does, what happens when you upload a PDF, and what happens when you ask a question.
+It is meant to be read top to bottom so you understand the complete data flow.
+
+
+--------------------------------------------------------------------------------
+1. HIGH-LEVEL OVERVIEW
+--------------------------------------------------------------------------------
+DocChat is a Retrieval-Augmented Generation (RAG) system. RAG means the language model
+does NOT answer from its own memory. Instead, it answers using text retrieved from YOUR
+document. This keeps answers grounded and reduces hallucination.
+
+There are two main phases:
+
+  PHASE A - INGESTION (happens once per PDF, when you click "Process")
+      PDF -> extract text -> split into chunks -> turn chunks into vectors (embeddings)
+          -> store vectors in a local database (ChromaDB)
+
+  PHASE B - QUESTION ANSWERING (happens every time you ask a question)
+      Question -> turn question into a vector -> find the most similar chunks in ChromaDB
+          -> stuff those chunks into a prompt -> send to the LLM -> return the answer
+
+The whole thing runs locally except for two network calls to Google: one to create
+embeddings, and one to generate the final answer.
+
+
+--------------------------------------------------------------------------------
+2. THE FILES AND THEIR ROLES
+--------------------------------------------------------------------------------
+app.py
+    The Streamlit front end. Renders the UI, handles the file upload, manages chat
+    history, and calls into rag_engine.py. It does not contain any AI logic itself.
+
+rag_engine.py
+    The "brain". Contains two functions:
+        - process_document_to_chroma(uploaded_file)  -> ingestion (Phase A)
+        - answer_question(question)                  -> retrieval + answer (Phase B)
+    Also defines the shared embedding model used by both phases.
+
+check_models.py
+    A small diagnostic helper that lists which Gemini models your API key can access.
+    Useful when a model name stops working (which is exactly why the models were updated).
+
+.streamlit/config.toml
+    Streamlit theme (dark matte colors) and server settings. Applied before the page
+    renders, so there is no flash of unstyled content.
+
+.streamlit/secrets.toml
+    Holds GOOGLE_API_KEY. Read by app.py and placed into the environment so LangChain's
+    Google client can authenticate. This file is git-ignored.
+
+chroma_db/ (created automatically)
+    The on-disk vector database. Holds the chunk text plus their embedding vectors.
+
+
+--------------------------------------------------------------------------------
+3. APP STARTUP FLOW (what happens when the page loads)
+--------------------------------------------------------------------------------
+1. Streamlit runs app.py from top to bottom.
+2. st.set_page_config(...) is called FIRST. This is mandatory; if any other Streamlit
+   command runs before it, the first page load errors and only works after a refresh.
+   (This was the cause of the old "two refreshes" bug, now fixed.)
+3. The app reads GOOGLE_API_KEY from st.secrets and copies it into os.environ so that
+   LangChain's Google integration can find it.
+4. rag_engine is imported. On import, the embedding model object is created once and
+   reused for the whole session.
+5. Custom CSS is injected for the matte look, the header is drawn, the sidebar is built,
+   and the chat history (if any) is rendered.
+
+Streamlit re-runs the ENTIRE app.py script on every interaction (button click, new
+question, etc.). To keep data alive across these re-runs, the app uses
+st.session_state (for example, st.session_state.messages stores chat history, and
+st.session_state.doc_ready tracks whether a document has been indexed).
+
+
+--------------------------------------------------------------------------------
+4. PHASE A - INGESTION (clicking "Process")  [rag_engine.process_document_to_chroma]
+--------------------------------------------------------------------------------
+Trigger: user uploads a PDF in the sidebar and clicks "Process".
+
+Step 1 - Receive the upload
+    Streamlit gives app.py an in-memory file object (uploaded_file). app.py passes it to
+    process_document_to_chroma().
+
+Step 2 - Save to a temporary file
+    PyPDFLoader needs a real file path, so the uploaded bytes are written to a temporary
+    .pdf file on disk.
+
+Step 3 - Load the PDF text
+    PyPDFLoader reads the temp file and returns one Document per page (with text content
+    and page metadata). The temp file is then deleted.
+
+Step 4 - Split into chunks
+    RecursiveCharacterTextSplitter breaks the text into chunks of about 1000 characters
+    with 200 characters of overlap between consecutive chunks. The overlap prevents a
+    sentence or idea from being cut in half and lost at chunk boundaries. add_start_index
+    records where each chunk started in the original text.
+    Why chunk at all? Because (a) embeddings work best on small focused passages, and
+    (b) we only want to send the few most relevant pieces to the LLM, not the whole PDF.
+
+Step 5 - Create embeddings and store them
+    Chroma.from_documents(...) takes each chunk, calls Google's embedding model
+    (models/gemini-embedding-001) to convert the chunk text into a numeric vector, and
+    writes the chunk text + vector into ChromaDB. The database is persisted to the
+    ./chroma_db directory so it survives app restarts.
+
+Step 6 - Report success
+    The function returns "Processed N chunks successfully!", which the sidebar shows. The
+    app also sets st.session_state.doc_ready = True so the sidebar status reads
+    "Document indexed".
+
+Result of Phase A: a searchable vector store containing your document, ready to query.
+
+
+--------------------------------------------------------------------------------
+5. PHASE B - QUESTION ANSWERING (typing a question)  [rag_engine.answer_question]
+--------------------------------------------------------------------------------
+Trigger: user types a question into the chat box.
+
+Step 1 - Capture and display the question
+    app.py appends the question to st.session_state.messages and shows it as a user
+    chat bubble, then calls answer_question(question).
+
+Step 2 - Connect to the existing vector store
+    A Chroma object is opened against the ./chroma_db directory, using the SAME embedding
+    model used during ingestion. (Using the same model matters: the question vector and
+    the stored chunk vectors must live in the same vector space to be comparable.)
+
+Step 3 - Build a retriever
+    vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 5}) creates a
+    retriever that will return the top 5 chunks most similar to the question.
+
+Step 4 - Embed the question and search
+    When the chain runs, the retriever embeds the question into a vector and asks ChromaDB
+    for the 5 nearest chunk vectors (semantic similarity, not keyword matching). These
+    chunks are the "context".
+
+Step 5 - Initialize the LLM
+    ChatGoogleGenerativeAI is created with model "gemini-2.5-flash" and temperature 0.3
+    (low temperature = more focused, less random answers).
+
+Step 6 - Build the prompt
+    A ChatPromptTemplate defines a system message instructing the model to answer ONLY
+    from the provided context, to say it does not know if the answer is absent, and to keep
+    the answer to about three sentences. The retrieved context is injected into {context}
+    and the user's question into {input}.
+
+Step 7 - Assemble and run the chain
+    create_stuff_documents_chain(llm, prompt) builds a chain that "stuffs" all retrieved
+    chunks into the {context} slot of the prompt. create_retrieval_chain(retriever, ...)
+    wraps it so that retrieval happens first, then generation. rag_chain.invoke({"input":
+    question}) executes the whole pipeline.
+
+Step 8 - Return and display the answer
+    The chain returns a dict; response["answer"] is the text. app.py displays it as an
+    assistant chat bubble and appends it to st.session_state.messages so it persists.
+
+Result of Phase B: a concise, document-grounded answer shown in the chat.
+
+
+--------------------------------------------------------------------------------
+6. DATA FLOW DIAGRAM (text form)
+--------------------------------------------------------------------------------
+INGESTION:
+    [PDF upload]
+        -> temp .pdf file
+        -> PyPDFLoader (text per page)
+        -> RecursiveCharacterTextSplitter (1000/200 chunks)
+        -> GoogleGenerativeAIEmbeddings (gemini-embedding-001)
+        -> ChromaDB (./chroma_db)   [stored: chunk text + vector]
+
+QUERYING:
+    [User question]
+        -> GoogleGenerativeAIEmbeddings (same model)  [question -> vector]
+        -> ChromaDB similarity search (top 5 chunks)  [-> context]
+        -> ChatPromptTemplate (context + question)
+        -> ChatGoogleGenerativeAI (gemini-2.5-flash)
+        -> [Answer shown in chat]
+
+
+--------------------------------------------------------------------------------
+7. EXTERNAL CALLS AND COST/QUOTA NOTES
+--------------------------------------------------------------------------------
+Two Google API calls are involved:
+    1. Embeddings  - one batch call per ingestion, and one small call per question.
+    2. Generation  - one call per question (the actual answer).
+
+On the free tier these have per-minute and per-day limits. Heavy or rapid use can return
+a 429 "quota exceeded" error. The fix is to wait ~30-60 seconds and retry, or enable
+billing for higher limits.
+
+
+--------------------------------------------------------------------------------
+8. COMMON FAILURE POINTS (and how they were resolved here)
+--------------------------------------------------------------------------------
+- 404 model not found during ingestion:
+    The embedding model name was outdated. Fixed by switching to gemini-embedding-001.
+    Run check_models.py to see currently valid model names for your key.
+
+- 429 quota exceeded when answering:
+    The chat model (gemini-2.0-flash) had no free-tier quota. Fixed by switching to
+    gemini-2.5-flash.
+
+- App needs two refreshes to load:
+    st.set_page_config was not the first Streamlit command. Fixed by moving it to the top.
+
+- Database file locked / cannot delete chroma_db:
+    A running app holds the SQLite file open. Stop the Streamlit process before deleting
+    or resetting ./chroma_db.
